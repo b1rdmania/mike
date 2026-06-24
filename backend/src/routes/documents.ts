@@ -22,6 +22,7 @@ import {
   loadActiveVersion,
 } from "../lib/documentVersions";
 import { ensureDocAccess } from "../lib/access";
+import { recordAudit, verifyAuditChain } from "../lib/auditChain";
 import { singleFileUpload } from "../lib/upload";
 
 export const documentsRouter = Router();
@@ -1254,6 +1255,17 @@ async function handleEditResolution(
     statusErr,
   });
 
+  // Legalise control layer: a human resolving an AI change is a supervision
+  // event — record it on the document's tamper-evident chain.
+  await recordAudit(db, {
+    documentId,
+    actorUserId: userId,
+    action: mode === "accept" ? "edit.accepted" : "edit.rejected",
+    resourceType: "document_edit",
+    resourceId: editId,
+    payload: { change_id: edit.change_id ?? null, version_id: doc.current_version_id ?? null },
+  });
+
   const { count: remainingPending } = await db
     .from("document_edits")
     .select("id", { count: "exact", head: true })
@@ -1288,6 +1300,204 @@ documentsRouter.post(
   "/:documentId/edits/:editId/reject",
   requireAuth,
   (req, res) => void handleEditResolution(req, res, "reject"),
+);
+
+// ---------------------------------------------------------------------------
+// Legalise control layer (experiment branch — fork only, not for upstream PR)
+// Sign-off on a document version + the tamper-evident audit trail.
+// ---------------------------------------------------------------------------
+
+const MACHINE_AUTHORED_SOURCES = new Set(["generated", "assistant_edit"]);
+const SIGNOFF_DECISIONS = new Set([
+  "signed",
+  "signed_with_observations",
+  "rejected",
+]);
+
+// POST /single-documents/:documentId/versions/:versionId/signoff
+// body: { decision: "signed" | "signed_with_observations" | "rejected", note?: string }
+documentsRouter.post(
+  "/:documentId/versions/:versionId/signoff",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const userEmail = res.locals.userEmail as string | undefined;
+    const { documentId, versionId } = req.params;
+    const decision = String(req.body?.decision ?? "");
+    const note =
+      typeof req.body?.note === "string" && req.body.note.trim()
+        ? String(req.body.note).trim()
+        : null;
+    if (!SIGNOFF_DECISIONS.has(decision)) {
+      return void res.status(400).json({ detail: "Invalid decision" });
+    }
+    const db = createServerSupabase();
+
+    const { data: doc } = await db
+      .from("documents")
+      .select("id, user_id, project_id, filename")
+      .eq("id", documentId)
+      .single();
+    if (!doc) return void res.status(404).json({ detail: "Document not found" });
+    const access = await ensureDocAccess(doc, userId, userEmail, db);
+    if (!access.ok)
+      return void res.status(404).json({ detail: "Document not found" });
+
+    const { data: version } = await db
+      .from("document_versions")
+      .select("id, document_id, source, version_number")
+      .eq("id", versionId)
+      .eq("document_id", documentId)
+      .single();
+    if (!version)
+      return void res.status(404).json({ detail: "Version not found" });
+
+    const source = (version.source as string | null) ?? "upload";
+    const machineAuthored = MACHINE_AUTHORED_SOURCES.has(source);
+    // The core rule: nobody signs as the author of AI-drafted work. For
+    // human-authored versions, the signer is the author only if they own
+    // the document they produced.
+    const signerIsAuthor = machineAuthored
+      ? false
+      : (doc.user_id as string) === userId;
+
+    const { data: signoff, error: signoffErr } = await db
+      .from("document_signoffs")
+      .insert({
+        document_id: documentId,
+        version_id: versionId,
+        version_source: source,
+        signer_user_id: userId,
+        signer_email: userEmail ?? null,
+        signer_is_author: signerIsAuthor,
+        decision,
+        note,
+      })
+      .select("id, decision, signer_is_author, version_source, signed_at")
+      .single();
+    if (signoffErr || !signoff) {
+      console.error("[signoff] insert failed", { signoffErr });
+      return void res.status(500).json({ detail: "Could not record sign-off" });
+    }
+
+    await recordAudit(db, {
+      documentId,
+      actorUserId: userId,
+      action: "signoff.recorded",
+      resourceType: "document_version",
+      resourceId: versionId,
+      payload: {
+        decision,
+        signer_is_author: signerIsAuthor,
+        version_source: source,
+        version_number: (version.version_number as number | null) ?? null,
+        signer_email: userEmail ?? null,
+      },
+    });
+
+    return void res.status(201).json({
+      ok: true,
+      signoff: {
+        id: signoff.id,
+        decision: signoff.decision,
+        signer_email: userEmail ?? null,
+        signer_is_author: signoff.signer_is_author,
+        version_source: signoff.version_source,
+        version_number: (version.version_number as number | null) ?? null,
+        signed_at: signoff.signed_at,
+      },
+    });
+  },
+);
+
+// GET /single-documents/:documentId/signoffs — the provenance trail.
+documentsRouter.get(
+  "/:documentId/signoffs",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const userEmail = res.locals.userEmail as string | undefined;
+    const { documentId } = req.params;
+    const db = createServerSupabase();
+
+    const { data: doc } = await db
+      .from("documents")
+      .select("id, user_id, project_id")
+      .eq("id", documentId)
+      .single();
+    if (!doc) return void res.status(404).json({ detail: "Document not found" });
+    const access = await ensureDocAccess(doc, userId, userEmail, db);
+    if (!access.ok)
+      return void res.status(404).json({ detail: "Document not found" });
+
+    const { data: rows } = await db
+      .from("document_signoffs")
+      .select(
+        "id, version_id, version_source, signer_email, signer_is_author, decision, note, signed_at",
+      )
+      .eq("document_id", documentId)
+      .order("signed_at", { ascending: false });
+
+    return void res.status(200).json({ signoffs: rows ?? [] });
+  },
+);
+
+// GET /single-documents/:documentId/audit — the hash-chained event log.
+documentsRouter.get(
+  "/:documentId/audit",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const userEmail = res.locals.userEmail as string | undefined;
+    const { documentId } = req.params;
+    const db = createServerSupabase();
+
+    const { data: doc } = await db
+      .from("documents")
+      .select("id, user_id, project_id")
+      .eq("id", documentId)
+      .single();
+    if (!doc) return void res.status(404).json({ detail: "Document not found" });
+    const access = await ensureDocAccess(doc, userId, userEmail, db);
+    if (!access.ok)
+      return void res.status(404).json({ detail: "Document not found" });
+
+    const { data: rows } = await db
+      .from("audit_events")
+      .select(
+        "seq, action, actor_user_id, resource_type, resource_id, payload, content_sha256, hash, created_at",
+      )
+      .eq("document_id", documentId)
+      .order("seq", { ascending: true });
+
+    const verification = await verifyAuditChain(db, documentId);
+    return void res.status(200).json({ events: rows ?? [], verification });
+  },
+);
+
+// GET /single-documents/:documentId/audit/verify — does the chain still hold?
+documentsRouter.get(
+  "/:documentId/audit/verify",
+  requireAuth,
+  async (req, res) => {
+    const userId = res.locals.userId as string;
+    const userEmail = res.locals.userEmail as string | undefined;
+    const { documentId } = req.params;
+    const db = createServerSupabase();
+
+    const { data: doc } = await db
+      .from("documents")
+      .select("id, user_id, project_id")
+      .eq("id", documentId)
+      .single();
+    if (!doc) return void res.status(404).json({ detail: "Document not found" });
+    const access = await ensureDocAccess(doc, userId, userEmail, db);
+    if (!access.ok)
+      return void res.status(404).json({ detail: "Document not found" });
+
+    const verification = await verifyAuditChain(db, documentId);
+    return void res.status(200).json(verification);
+  },
 );
 
 async function handleDocumentUpload(

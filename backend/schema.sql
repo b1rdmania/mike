@@ -820,3 +820,57 @@ revoke all on public.user_mcp_connector_tools from anon, authenticated;
 revoke all on public.user_mcp_tool_audit_logs from anon, authenticated;
 revoke all on public.courtlistener_citation_index from anon, authenticated;
 revoke all on public.courtlistener_opinion_cluster_index from anon, authenticated;
+
+-- ---------------------------------------------------------------------------
+-- Legalise control layer (experiment branch — fork only, not for upstream PR)
+-- Sign-off: a named human stands behind a specific document version. The
+-- author is never the signer of AI-drafted work — signer_is_author is forced
+-- false whenever the version was machine-authored (generated / assistant_edit).
+-- Append-only. The record is the point.
+-- ---------------------------------------------------------------------------
+create table if not exists public.document_signoffs (
+  id uuid primary key default gen_random_uuid(),
+  document_id uuid not null references public.documents(id) on delete cascade,
+  version_id uuid not null references public.document_versions(id) on delete cascade,
+  version_source text not null,
+  signer_user_id text not null,
+  signer_email text,
+  signer_is_author boolean not null,
+  decision text not null
+    check (decision = any (array[
+      'signed'::text,
+      'signed_with_observations'::text,
+      'rejected'::text
+    ])),
+  note text,
+  signed_at timestamptz not null default now()
+);
+
+create index if not exists document_signoffs_document_id_idx
+  on public.document_signoffs(document_id, signed_at desc);
+create index if not exists document_signoffs_version_id_idx
+  on public.document_signoffs(version_id);
+
+-- Audit trail: per-document, hash-chained event log. Each event's hash covers
+-- the previous event's hash, so altering or deleting a past event breaks every
+-- link after it. Append-only.  hash = sha256(prev_hash + canonical(fields))
+create table if not exists public.audit_events (
+  id uuid primary key default gen_random_uuid(),
+  seq bigserial,
+  document_id uuid references public.documents(id) on delete cascade,
+  actor_user_id text,
+  action text not null,
+  resource_type text,
+  resource_id text,
+  payload jsonb not null default '{}'::jsonb,
+  content_sha256 text,
+  prev_hash text not null default '',
+  hash text not null,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists audit_events_document_id_idx
+  on public.audit_events(document_id, seq);
+
+revoke all on public.document_signoffs from anon, authenticated;
+revoke all on public.audit_events from anon, authenticated;
