@@ -1335,7 +1335,7 @@ documentsRouter.post(
 
     const { data: doc } = await db
       .from("documents")
-      .select("id, user_id, project_id, filename")
+      .select("id, user_id, project_id")
       .eq("id", documentId)
       .single();
     if (!doc) return void res.status(404).json({ detail: "Document not found" });
