@@ -13,6 +13,7 @@ import {
     X,
 } from "lucide-react";
 import { ConfirmPopup } from "@/app/components/shared/ConfirmPopup";
+import { DocumentSignoffPanel } from "@/app/components/projects/DocumentSignoffPanel";
 import { DocView } from "@/app/components/shared/DocView";
 import { WarningPopup } from "@/app/components/shared/WarningPopup";
 import type { Document } from "@/app/components/shared/types";
@@ -857,6 +858,18 @@ export function DocumentSidePanel({
                                             );
                                         })}
                                     </div>
+                                )}
+                                {selectedVersionId && (
+                                    <DocumentSignoffPanel
+                                        documentId={documentId}
+                                        selectedVersionId={selectedVersionId}
+                                        selectedVersionNumber={
+                                            selectedVersionNumber
+                                        }
+                                        selectedVersionSource={
+                                            selectedVersion?.source ?? null
+                                        }
+                                    />
                                 )}
                             </div>
                         </div>

@@ -1213,3 +1213,73 @@ export async function deleteWorkflowShare(
         method: "DELETE",
     });
 }
+
+// ---------------------------------------------------------------------------
+// Legalise control layer (experiment — sign-off + tamper-evident audit trail)
+// Not part of upstream Mike. See experiment/legalise-controls.
+// ---------------------------------------------------------------------------
+
+export type SignoffDecision =
+    | "signed"
+    | "signed_with_observations"
+    | "rejected";
+
+export interface Signoff {
+    id: string;
+    version_id: string;
+    version_source: string;
+    signer_email: string | null;
+    signer_is_author: boolean;
+    decision: SignoffDecision;
+    note: string | null;
+    signed_at: string;
+}
+
+export interface AuditEvent {
+    seq: number;
+    action: string;
+    actor_user_id: string | null;
+    resource_type: string | null;
+    resource_id: string | null;
+    payload: Record<string, unknown> | null;
+    content_sha256: string | null;
+    hash: string;
+    created_at: string;
+}
+
+export interface AuditVerification {
+    ok: boolean;
+    count: number;
+    /** seq of the first event whose hash didn't recompute, if any. */
+    broken_at_seq: number | null;
+    reason: string | null;
+}
+
+export async function signOffVersion(
+    documentId: string,
+    versionId: string,
+    decision: SignoffDecision,
+    note?: string,
+): Promise<{ ok: boolean; signoff: Signoff }> {
+    return apiRequest(
+        `/single-documents/${documentId}/versions/${versionId}/signoff`,
+        {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ decision, note: note ?? undefined }),
+        },
+    );
+}
+
+export async function listSignoffs(
+    documentId: string,
+): Promise<{ signoffs: Signoff[] }> {
+    return apiRequest(`/single-documents/${documentId}/signoffs`);
+}
+
+export async function getDocumentAudit(documentId: string): Promise<{
+    events: AuditEvent[];
+    verification: AuditVerification;
+}> {
+    return apiRequest(`/single-documents/${documentId}/audit`);
+}
