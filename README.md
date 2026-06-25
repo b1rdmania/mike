@@ -1,152 +1,65 @@
-# Mike
+# Mike × Legalise — a portability experiment
 
-Mike is a legal document assistant with a Next.js frontend, an Express backend, Supabase Auth/Postgres, and Cloudflare R2-compatible object storage.
+> **This is an experimental fork of [Mike](https://github.com/willchen96/mike) — not a product, and not a proposed change to Mike.** It exists to answer one question: can a governance layer built for one legal‑AI workspace drop cleanly into a *different* one it was never designed for? Here it is, running natively inside Mike. Source is public under the same licence as upstream (AGPL‑3.0). Nothing here is headed for Mike's `main` beyond a separate, unrelated content‑hashes PR ([willchen96/mike#181](https://github.com/willchen96/mike/pull/181)).
 
-Website: [mikeoss.com](https://mikeoss.com)
+## What this is
 
-## Contents
+[Legalise](https://github.com/b1rdmania/legalise) is an open‑source **governance layer for legal AI** — human sign‑off plus a tamper‑evident audit trail for work an AI helped produce. The thesis is that these controls shouldn't be welded to one product; they should bolt onto whatever workspace you already use.
 
-- `frontend/` - Next.js application
-- `backend/` - Express API, Supabase access, document processing, and database schema
-- `backend/schema.sql` - Supabase schema for fresh databases
-- `backend/migrations/` - dated, incremental schema migrations; on an existing database, apply the files dated after the Mike version you deployed
+This fork is the proof. We grafted the Legalise controls onto **Mike**, an open‑source legal document assistant we don't own, and they run natively — against Mike's own Postgres and auth, with no Legalise stack anywhere in the picture.
 
-## Prerequisites
+The honest framing: **Mike already has a natural home for this.** That's the whole point. Not "we integrated our thing into Mike" — rather, "these controls travel, and here's one workspace they travelled to."
 
-- Node.js 20 or newer
-- npm
-- git
-- A Supabase project
-- A Cloudflare R2 bucket, MinIO bucket, or another S3-compatible bucket
-- At least one supported model provider API key: Anthropic, Google Gemini, or OpenAI
-- Optional: a CourtListener API token for case law lookup and citation verification
-- LibreOffice installed locally if you need DOC/DOCX to PDF conversion
+## What we added
 
-## Database Setup
+A self‑contained layer (~900 lines across 7 files) on top of upstream Mike:
 
-For a new Supabase database, open the Supabase SQL editor and run:
+**Backend**
+- `document_signoffs` and `audit_events` tables (`backend/schema.sql`)
+- `backend/src/lib/auditChain.ts` — a per‑document SHA‑256 hash chain
+- Four routes in `backend/src/routes/documents.ts`: record a sign‑off, list sign‑offs, read the audit trail, and **verify** the chain
 
-```sql
--- copy and run the contents of:
--- backend/schema.sql
-```
+**Frontend**
+- `DocumentSignoffPanel.tsx` + a `useDocumentSignoffs` hook + API helpers, mounted under the Versions list in Mike's document side‑panel
 
-The schema file is for fresh deployments and already includes the latest database shape.
+**The keystone rule** (enforced server‑side): for any `generated` or `assistant_edit` document version, `signer_is_author` is **forced to false**. Nobody can sign as the author of machine‑written text. The entire point of the layer is that a *human* takes responsibility for AI output, and the record is not allowed to pretend otherwise.
 
-For an existing database, do not run the full schema file over production data. Instead, apply the incremental files in `backend/migrations/`: run the migrations dated **after** the version of Mike you currently have deployed, in filename order. Each file is named `YYYYMMDD_<name>.sql` (the date is also recorded in a comment at the top of the file) and is written to be safe to re-run, so when unsure you can re-apply the most recent migrations without harm.
+## See it work
 
-## Environment
+These are real screengrabs from the running Mike UI with the layer mounted.
 
-Create local env files:
+**1 — Sign‑off panel, inside Mike's document side‑panel**
 
-```bash
-touch backend/.env
-touch frontend/.env.local
-```
+![Sign-off panel in the Mike UI](docs/legalise-experiment/01-signoff-panel.png)
 
-Create `backend/.env`:
+**2 — The audit chain verifies**
 
-```bash
-PORT=3001
-FRONTEND_URL=http://localhost:3000
-DOWNLOAD_SIGNING_SECRET=replace-with-a-random-32-byte-hex-string
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SECRET_KEY=your-supabase-service-role-key
+![Audit chain verification passing](docs/legalise-experiment/02-chain-verified.png)
 
-R2_ENDPOINT_URL=https://your-account-id.r2.cloudflarestorage.com
-R2_ACCESS_KEY_ID=your-r2-access-key
-R2_SECRET_ACCESS_KEY=your-r2-secret-key
-R2_BUCKET_NAME=mike
+**3 — Tamper a past row directly in the database → verification fails, and points at the break**
 
-GEMINI_API_KEY=your-gemini-key
-ANTHROPIC_API_KEY=your-anthropic-key
-OPENAI_API_KEY=your-openai-key
-RESEND_API_KEY=your-resend-key
-USER_API_KEYS_ENCRYPTION_SECRET=your-long-random-secret
+![Audit chain verification failing after tamper](docs/legalise-experiment/03-chain-broken.png)
 
-# Optional: enables CourtListener case law and citation tools.
-COURTLISTENER_API_TOKEN=your-courtlistener-token
+Validated end‑to‑end against a local Supabase stack (real Postgres, auth, JWT): a human‑uploaded version signs with author = true; an AI‑drafted version signs with author **forced** false even for the same user; the provenance trail is intact; the chain verifies; and a direct‑database edit of a past row makes verification return `ok: false` with the broken sequence index.
 
-# Optional: use locally imported CourtListener bulk data for faster case reads.
-COURTLISTENER_BULK_DATA_ENABLED=false
-```
+## Run it yourself
 
-Create `frontend/.env.local`:
+The layer needs only Mike's own dependencies — no Legalise services, and no model keys for the sign‑off path.
 
-```bash
-NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
-NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY=your-supabase-anon-key
-NEXT_PUBLIC_API_BASE_URL=http://localhost:3001
-```
+1. Start a local Supabase stack: `npx supabase start`
+2. Apply `backend/schema.sql`, then `grant all on all tables in schema public to service_role;` (cloud Supabase grants this automatically; local does not)
+3. Point the backend `.env` `SUPABASE_URL` at the local API; dummy R2 / model keys are fine
+4. Run Mike's backend and frontend as usual (front end on `:3002` if something else owns `:3000`; set the backend `FRONTEND_URL` to match for CORS)
+5. Upload a document, draft a version with the assistant, and open the sign‑off panel under Versions
 
-Supabase values come from the project dashboard. Use the project URL for `SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_URL`, the service role key for the backend `SUPABASE_SECRET_KEY`, and the anon/public key for `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY`. If your Supabase project shows multiple key formats, use the legacy JWT-style anon and service role keys expected by the Supabase client libraries.
+## What this is *not*
 
-Provider keys are only needed for the models, legal research, and email features you plan to use. Model provider keys and the CourtListener token can be configured in `backend/.env` for the whole instance, or per user in **Account > Models & API Keys**. If a provider key is present in `backend/.env`, that provider is available by default and the matching browser API key field is read-only.
+- **Not a product.** It's a portability demo for [Legalise](https://github.com/b1rdmania/legalise).
+- **Not a change to Mike.** These commits live only on this fork; nothing is proposed to Mike's `main` beyond the unrelated [#181](https://github.com/willchen96/mike/pull/181).
+- **Experimental.** It exercises one path (document sign‑off + audit). Expect rough edges.
 
-## CourtListener Integration
+## Credits & licence
 
-Mike can use CourtListener for US case law citation verification, case fetching, targeted opinion search, and case-law panels in assistant responses.
+[**Mike**](https://github.com/willchen96/mike) is an open‑source legal document assistant by [Will Chen](https://github.com/willchen96) — Next.js + Express + Supabase + Cloudflare R2, [mikeoss.com](https://mikeoss.com). All credit for the workspace this builds on is his.
 
-To enable live CourtListener access, set `COURTLISTENER_API_TOKEN` in `backend/.env` and restart the backend. Users can also add their own CourtListener token from **Account > Models & API Keys** when the instance does not provide one globally.
-
-Fresh databases created from `backend/schema.sql` already include the CourtListener support tables. Existing deployments should apply the matching dated migration in `backend/migrations/` before enabling the feature.
-
-Bulk data is optional. When `COURTLISTENER_BULK_DATA_ENABLED=true`, Mike first tries local Supabase/R2 data before falling back to CourtListener's API:
-
-- citation metadata is read from `public.courtlistener_citation_index`
-- case cluster metadata is read from `public.courtlistener_opinion_cluster_index`
-- cached opinion JSON is read from the R2 prefix `courtlistener/opinions/by-cluster/{clusterId}/{opinionId}.json`
-
-If you do not import bulk data, leave `COURTLISTENER_BULK_DATA_ENABLED=false`; live CourtListener tools still work with a valid token, subject to CourtListener rate limits.
-
-## Install
-
-Install each app package:
-
-```bash
-npm install --prefix backend
-npm install --prefix frontend
-```
-
-## Run Locally
-
-Start the backend:
-
-```bash
-npm run dev --prefix backend
-```
-
-Start the main app:
-
-```bash
-npm run dev --prefix frontend
-```
-
-Open `http://localhost:3000`.
-
-## First Run
-
-1. Sign up in the app.
-2. If you did not set provider keys in `backend/.env`, open **Account > Models & API Keys** and add an Anthropic, Gemini, or OpenAI API key.
-3. To use legal research tools, add a CourtListener token in `backend/.env` or **Account > Models & API Keys**.
-4. Create or open a project and start chatting with documents.
-
-## Troubleshooting
-
-**Sign-up confirmation email never arrives.** Confirmation emails are sent by Supabase Auth, not by Mike. For local development, the simplest fix is to disable email confirmation in **Supabase > Authentication > Providers > Email**. For production, configure custom SMTP in Supabase; the built-in mailer is heavily rate-limited and may be restricted on newer projects.
-
-**The model picker shows a missing-key warning.** Add a key for that provider in **Account > Models & API Keys**, or configure the provider key in `backend/.env` and restart the backend.
-
-**CourtListener tools say the API token is missing.** Set `COURTLISTENER_API_TOKEN` in `backend/.env`, or add a CourtListener token in **Account > Models & API Keys** for the signed-in user. Restart the backend after changing `.env`.
-
-**CourtListener bulk lookup is not returning local results.** Confirm `COURTLISTENER_BULK_DATA_ENABLED=true`, the two CourtListener tables have been populated, and opinion JSON exists in R2 under `courtlistener/opinions/by-cluster/`. If bulk data is unavailable, Mike falls back to the live API when a token is configured.
-
-**DOC or DOCX conversion fails.** Install LibreOffice locally and restart the backend so document conversion commands are available on the process path.
-
-## Useful Checks
-
-```bash
-npm run build --prefix backend
-npm run build --prefix frontend
-npm run lint --prefix frontend
-```
+This fork is distributed under Mike's licence, **AGPL‑3.0**; the added governance layer is part of the [Legalise](https://github.com/b1rdmania/legalise) project and is published here under the same terms.
