@@ -29,6 +29,22 @@ const PKCS8_ED25519_PREFIX = Buffer.from(
 const SPKI_ED25519_PREFIX = Buffer.from("302a300506032b6570032100", "hex");
 
 const ED25519_KEY_BYTES = 32;
+const ED25519_SIGNATURE_HEX_CHARS = 128;
+
+/**
+ * Domain separation. The signature covers this context string and a NUL byte
+ * before the digest, so a signature made here can never be replayed as one
+ * over some other object that happens to hash to the same 32 bytes. Bump the
+ * version suffix if the signed payload's shape ever changes.
+ */
+const SIGNING_CONTEXT = "mike-project-manifest-v1";
+
+function signedPayload(digestHex: string): Buffer {
+    return Buffer.concat([
+        Buffer.from(`${SIGNING_CONTEXT}\0`, "utf8"),
+        Buffer.from(digestHex, "hex"),
+    ]);
+}
 
 export interface ManifestSignature {
     algorithm: "ed25519";
@@ -36,7 +52,7 @@ export interface ManifestSignature {
     key_id: string;
     /** Raw Ed25519 public key, hex. Convenience only — see verifyManifest. */
     public_key: string;
-    /** Signature over the raw digest bytes, hex. */
+    /** Signature over SIGNING_CONTEXT + NUL + the raw digest bytes, hex. */
     value: string;
 }
 
@@ -72,6 +88,14 @@ function publicKeyFromRaw(raw: Buffer): crypto.KeyObject {
     });
 }
 
+function keyIdFromRawPublicKey(raw: Buffer): string {
+    return crypto
+        .createHash("sha256")
+        .update(raw)
+        .digest("hex")
+        .slice(0, 16);
+}
+
 /**
  * The configured signing key, or null when signing is off. Both signing and
  * key publication go through here so they cannot disagree about the key id.
@@ -98,11 +122,7 @@ function signingKey(): {
         privateKey,
         identity: {
             algorithm: "ed25519",
-            key_id: crypto
-                .createHash("sha256")
-                .update(publicKeyRaw)
-                .digest("hex")
-                .slice(0, 16),
+            key_id: keyIdFromRawPublicKey(publicKeyRaw),
             public_key: publicKeyRaw.toString("hex"),
         },
     };
@@ -126,6 +146,13 @@ export function manifestPublicKey(): SigningIdentity | null {
  * manifest holds no floats, so that spec's number rules do not bite.)
  */
 export function canonicalize(value: unknown): string {
+    // NaN and Infinity both stringify to "null", which would let two different
+    // bodies share a digest. Nothing in a manifest is a float, so this is a
+    // guard rather than a live concern, but a digest collision is the one
+    // thing canonicalisation must not permit.
+    if (typeof value === "number" && !Number.isFinite(value)) {
+        throw new TypeError("Manifest bodies must hold finite numbers");
+    }
     if (value === null || typeof value !== "object") return JSON.stringify(value);
     if (Array.isArray(value)) return `[${value.map(canonicalize).join(",")}]`;
 
@@ -151,7 +178,8 @@ export function digestManifestBody(body: unknown): ManifestDigest {
  * Attach `digest` and `signature` to a manifest body.
  *
  * The digest covers the body only — neither `digest` nor `signature` is an
- * input to itself. The signature is over the digest's raw bytes.
+ * input to itself. The signature is over a context string, a NUL byte, and
+ * then the digest's raw bytes; see SIGNING_CONTEXT.
  */
 export function sealManifest<T extends Record<string, unknown>>(
     body: T,
@@ -166,7 +194,7 @@ export function sealManifest<T extends Record<string, unknown>>(
         signature: {
             ...key.identity,
             value: crypto
-                .sign(null, Buffer.from(digest.value, "hex"), key.privateKey)
+                .sign(null, signedPayload(digest.value), key.privateKey)
                 .toString("hex"),
         },
     };
@@ -213,32 +241,59 @@ export function verifyManifest(
         signature?: ManifestSignature | null;
     } & Record<string, unknown>;
 
+    let bodyDigest: ManifestDigest;
+    try {
+        bodyDigest = digestManifestBody(body);
+    } catch {
+        return "tampered";
+    }
+
     if (
         !digest ||
+        typeof digest !== "object" ||
         digest.algorithm !== "sha256" ||
-        digest.value !== digestManifestBody(body).value
+        typeof digest.value !== "string" ||
+        !/^[0-9a-f]{64}$/.test(digest.value) ||
+        digest.value !== bodyDigest.value
     ) {
         return "tampered";
     }
 
-    if (!signature) return "unsigned";
+    if (signature == null) return "unsigned";
+    if (
+        typeof signature !== "object" ||
+        signature.algorithm !== "ed25519" ||
+        typeof signature.public_key !== "string" ||
+        !/^[0-9a-fA-F]{64}$/.test(signature.public_key) ||
+        typeof signature.value !== "string" ||
+        !new RegExp(`^[0-9a-fA-F]{${ED25519_SIGNATURE_HEX_CHARS}}$`).test(
+            signature.value,
+        )
+    ) {
+        return "bad-signature";
+    }
 
+    const hasExpectedKey = expectedPublicKey !== undefined;
     const expected = expectedPublicKey?.trim().toLowerCase();
-    const keyHex = expected ?? signature.public_key?.toLowerCase();
-    if (expected && expected !== signature.public_key?.toLowerCase()) {
+    if (hasExpectedKey && (!expected || !/^[0-9a-f]{64}$/.test(expected))) {
+        return "bad-signature";
+    }
+
+    const embeddedKey = signature.public_key.toLowerCase();
+    if (expected && expected !== embeddedKey) {
         return "key-mismatch";
     }
-    if (!keyHex || !/^[0-9a-f]{64}$/.test(keyHex)) return "bad-signature";
+    const keyHex = expected ?? embeddedKey;
 
     try {
         const ok = crypto.verify(
             null,
-            Buffer.from(digest.value, "hex"),
+            signedPayload(digest.value),
             publicKeyFromRaw(Buffer.from(keyHex, "hex")),
             Buffer.from(signature.value, "hex"),
         );
         if (!ok) return "bad-signature";
-        return expected ? "verified" : "self-signed";
+        return hasExpectedKey ? "verified" : "self-signed";
     } catch {
         return "bad-signature";
     }

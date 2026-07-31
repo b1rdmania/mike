@@ -1,7 +1,9 @@
 import {
+  deleteFile,
   downloadFile,
   generatedDocKey,
   uploadFile,
+  versionStorageKey,
 } from "../../storage";
 import { convertedPdfKey, docxToPdf } from "../../convert";
 import { createServerSupabase } from "../../supabase";
@@ -1178,9 +1180,16 @@ export async function runEditDocument(params: {
   let nextVersionNumber: number;
 
   if (reuseVersion) {
-    // Overwrite the existing turn version's file in place. The version
-    // row, version_number, and current_version_id all already point here.
-    newPath = reuseVersion.storagePath;
+    // Preserve the row and version number, but write to a fresh object and
+    // switch storage_path + content_sha256 together. This prevents a failed
+    // or concurrent database update from pairing new bytes with an old hash.
+    const previousPath = reuseVersion.storagePath;
+    newPath = versionStorageKey(
+      userId,
+      documentId,
+      crypto.randomUUID().replace(/-/g, ""),
+      versionFilename || "document.docx",
+    );
     versionRowId = reuseVersion.versionId;
     nextVersionNumber = reuseVersion.versionNumber;
     await uploadFile(
@@ -1188,15 +1197,29 @@ export async function runEditDocument(params: {
       ab,
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     );
-    await db
+    const { data: updatedVersion, error: versionUpdateError } = await db
       .from("document_versions")
       .update({
+        storage_path: newPath,
         file_type: "docx",
         size_bytes: editedBytes.byteLength,
         page_count: null,
         content_sha256: contentSha256(editedBytes),
       })
-      .eq("id", versionRowId);
+      .eq("id", versionRowId)
+      .eq("storage_path", previousPath)
+      .select("id")
+      .maybeSingle();
+    if (versionUpdateError || !updatedVersion) {
+      await deleteFile(newPath).catch(() => {});
+      return {
+        ok: false,
+        error: versionUpdateError
+          ? "Failed to update document version."
+          : "Document changed while applying edits. Please try again.",
+      };
+    }
+    await deleteFile(previousPath).catch(() => {});
   } else {
     const versionId = crypto.randomUUID().replace(/-/g, "");
     newPath = `documents/${userId}/${documentId}/edits/${versionId}.docx`;

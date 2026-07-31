@@ -192,7 +192,8 @@ export async function buildProjectExportManifest(db: Db, projectId: string) {
         (query) =>
             query
                 .eq("project_id", projectId)
-                .order("created_at", { ascending: true }),
+                .order("created_at", { ascending: true })
+                .order("id", { ascending: true }),
         "id, project_id, status, current_version_id, created_at",
     );
     const documentIds = idsFrom(documents);
@@ -206,7 +207,8 @@ export async function buildProjectExportManifest(db: Db, projectId: string) {
                   (query) =>
                       query
                           .in("document_id", documentIds)
-                          .order("created_at", { ascending: true }),
+                          .order("created_at", { ascending: true })
+                          .order("id", { ascending: true }),
                   "id, document_id, version_number, source, filename, file_type, size_bytes, content_sha256, deleted_at, created_at",
               ),
         documentIds.length === 0
@@ -217,7 +219,8 @@ export async function buildProjectExportManifest(db: Db, projectId: string) {
                   (query) =>
                       query
                           .in("document_id", documentIds)
-                          .order("created_at", { ascending: true }),
+                          .order("created_at", { ascending: true })
+                          .order("id", { ascending: true }),
                   "id, document_id, version_id, change_id, status, created_at, resolved_at",
               ),
     ]);

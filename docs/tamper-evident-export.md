@@ -1,163 +1,58 @@
 # Tamper-Evident Project Export
 
-Mike records a SHA-256 of every document version's bytes at write time, and can
-export a per-project manifest listing those hashes alongside the accept/reject
-trail. A recipient can then check that the files they were given are the files
-the workspace held.
+Mike records a SHA-256 digest whenever it writes document-version bytes and
+exports those hashes with the accept/reject trail. This proves file integrity
+relative to the manifest; signing also lets a holder of the deployment's public
+key verify the manifest's provenance.
 
-This answers the question a firm asks before it will rely on a tool's output:
-*can you show that this is what was reviewed and accepted?*
+`GET /projects/:projectId/export` uses the same project-member access check as
+the rest of the project API, requires MFA when enrolled, and shares the
+account-export rate limit.
 
-## What Is Recorded
+Each version includes its filename, metadata, and `content_sha256`; edits
+include identifiers and resolution status, never edit text. Compare a supplied
+file using `shasum -a 256 lease.docx`.
 
-Mike sets `document_versions.content_sha256` wherever it writes version bytes:
-upload, version upload, version replace, copy into a project, assistant edit,
-generated documents, and bulk replication. It refreshes the hash when
-accept/reject resolution rewrites those bytes in place.
+Versions created before hashing was deployed retain a `null` digest until their
+bytes are rewritten. They are unverifiable, not falsely verified.
 
-The column is nullable. Versions written before this shipped stay unhashed
-until something next rewrites their bytes, and show as `null` in the manifest.
-An old file set therefore reads as unverifiable rather than as falsely
-verified. Backfilling would mean streaming every stored object out of R2, so
-that belongs in a separate opt-in job, not a schema migration.
+## Manifest verification
 
-## Getting a Manifest
-
-```
-GET /projects/:projectId/export
-```
-
-Same access rules as the rest of the project API, and the same MFA requirement
-and export rate limit as the account exports. The response is a JSON
-attachment:
-
-```jsonc
-{
-  "manifest_version": 1,
-  "exported_at": "2026-07-31T10:00:00.000Z",
-  "project": { "id": "...", "name": "...", "cm_number": "...", "created_at": "..." },
-  "documents": [
-    {
-      "id": "...",
-      "status": "ready",
-      "current_version_id": "...",
-      "created_at": "...",
-      "versions": [
-        {
-          "id": "...",
-          "version_number": 1,
-          "source": "upload",
-          "filename": "lease.docx",
-          "file_type": "docx",
-          "size_bytes": 24576,
-          "content_sha256": "…",
-          "deleted_at": null,
-          "created_at": "..."
-        }
-      ],
-      "edits": [
-        {
-          "id": "...",
-          "version_id": "...",
-          "change_id": "...",
-          "status": "accepted",
-          "created_at": "...",
-          "resolved_at": "..."
-        }
-      ]
-    }
-  ],
-  "digest": { "algorithm": "sha256", "value": "…" },
-  "signature": null
-}
-```
-
-The edit trail carries references only: change ids and how they were resolved.
-It never carries the text of an edit.
-
-## Verifying Files
-
-```bash
-shasum -a 256 lease.docx
-```
-
-Compare against `content_sha256` for that version. A match means the file is
-byte-identical to what Mike stored.
-
-## Verifying the Manifest Itself
-
-File hashes prove nothing if the manifest itself cannot be trusted. `digest`
-is a SHA-256 over the manifest body, meaning everything except `digest` and
-`signature`. Serialise that body with object keys sorted, arrays left in
-order, and no whitespace. Sorting is part of the format, not an implementation
-detail, because JSON parsers do not preserve key order.
+`digest` is SHA-256 over the manifest body (everything except `digest` and
+`signature`). Canonical serialization sorts object keys, preserves array order,
+and emits no whitespace. Only JSON values are accepted.
 
 When `MANIFEST_SIGNING_KEY` is set, `signature` carries an Ed25519 signature
-over the digest's raw bytes:
+plus the raw public key and a short key id. The signature covers the context
+string `mike-project-manifest-v1`, a NUL byte, and then the digest bytes. That
+prefix keeps one signing key usable for other object types later without a
+signature from one context passing as a signature from another. Pin the public
+key from `GET /manifest-signing-key` rather than the manifest.
 
-```jsonc
-"signature": {
-  "algorithm": "ed25519",
-  "key_id": "…",         // first 16 hex chars of SHA-256 over the public key
-  "public_key": "…",     // raw Ed25519 public key, hex
-  "value": "…"           // signature over the digest bytes, hex
-}
-```
+Never trust only the key embedded in the manifest: an editor can replace the
+body and re-sign it with their own key. `verifyManifest(manifest,
+expectedPublicKey)` returns:
 
-Check the signature against the key the deployment serves, **not** the copy
-inside the manifest. Whoever edits a manifest can re-sign it with a key of
-their own, so the embedded key is a convenience, not evidence.
+| Verdict         | Meaning                                                  |
+| --------------- | -------------------------------------------------------- |
+| `verified`      | Digest and signature match the pinned key.               |
+| `self-signed`   | Signature is valid, but no key was pinned; not evidence. |
+| `unsigned`      | Digest matches, but no signature is present.             |
+| `key-mismatch`  | The embedded key differs from the pinned key.            |
+| `bad-signature` | The signature envelope or signature is invalid.          |
+| `tampered`      | The body does not match the recorded digest.             |
 
-```
-GET /manifest-signing-key
-```
+Only `verified` establishes provenance.
 
-That endpoint needs no authentication, since public keys are public. It
-returns `null` on a deployment that does not sign.
-
-`backend/src/lib/manifestSigning.ts` exports
-`verifyManifest(manifest, expectedPublicKey)`, which returns one of:
-
-| Verdict | Meaning |
-| --- | --- |
-| `verified` | Digest matches and the signature checks out against the key you pinned. |
-| `self-signed` | Signature checks out against the key inside the manifest, but you pinned none. Not evidence. |
-| `unsigned` | Digest matches, but the deployment did not sign. |
-| `key-mismatch` | Signed by a key other than the one you pinned. |
-| `bad-signature` | Signed, digest intact, signature does not verify. |
-| `tampered` | The body does not match its recorded digest. |
-
-Only `verified` means provenance was checked. Calling `verifyManifest` without
-`expectedPublicKey` returns `self-signed` even for a perfect signature, because
-whoever rewrites a manifest can re-sign it with a key of their own and swap in
-the matching public key. That forgery is indistinguishable from the real thing
-until you pin a key.
-
-## Enabling Signing
-
-```bash
-openssl rand -hex 32
-```
-
-Set the result as `MANIFEST_SIGNING_KEY` in `backend/.env` and restart. Use a
-dedicated secret, not one shared with `DOWNLOAD_SIGNING_SECRET`.
-
-Signing is optional so that a self-hosted deployment without key custody can
-still export. A malformed key fails the export with a clear error instead of
-quietly producing an unsigned manifest, which is the failure this feature
-exists to prevent.
-
-Rotating the key does not invalidate past exports, but whoever checks one
-needs the key that was current when Mike made it. `key_id` says which key that
-was. Publish retired public keys if old manifests need to stay checkable.
+Generate a signing seed with `openssl rand -hex 32` and set it as
+`MANIFEST_SIGNING_KEY`. A malformed key fails export rather than silently
+downgrading to unsigned. Retain retired public keys if old manifests must remain
+verifiable after rotation.
 
 ## Limits
 
-- The manifest attests to bytes and to the accept/reject trail. It is not a
-  trusted timestamp: `exported_at` is the server's clock, and nothing here
-  proves *when* a document existed. An RFC 3161 timestamp or a transparency
-  log would be the next step. Both need infrastructure a self-hosted
-  deployment may not have.
-- A holder of the signing key can produce a manifest saying anything. The key
-  is only as good as the deployment holding it.
-- Hashes cover the source bytes, not the converted PDF rendition.
+- Nothing backfills rows written before this shipped.
+- `exported_at` is the server clock, not a trusted timestamp.
+- Anyone holding the signing key can create a valid manifest.
+- Hashes cover source bytes, not converted PDF renditions.
+- The manifest builds in memory, as the account exports already do.

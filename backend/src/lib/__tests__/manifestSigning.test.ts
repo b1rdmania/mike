@@ -11,6 +11,25 @@ import {
 const KEY_A = "11".repeat(32);
 const KEY_B = "22".repeat(32);
 
+/** Rebuilds the signed payload independently of the module under test. */
+function payloadFor(digestHex: string, context: string): Buffer {
+    return Buffer.concat([
+        Buffer.from(`${context}\0`, "utf8"),
+        Buffer.from(digestHex, "hex"),
+    ]);
+}
+
+function publicKeyOf(publicKeyHex: string): crypto.KeyObject {
+    return crypto.createPublicKey({
+        key: Buffer.concat([
+            Buffer.from("302a300506032b6570032100", "hex"),
+            Buffer.from(publicKeyHex, "hex"),
+        ]),
+        format: "der",
+        type: "spki",
+    });
+}
+
 function withKey(hex: string | null) {
     if (hex === null) delete process.env.MANIFEST_SIGNING_KEY;
     else process.env.MANIFEST_SIGNING_KEY = hex;
@@ -53,6 +72,11 @@ describe("canonicalize", () => {
         expect(canonicalize({ a: null, b: undefined, c: 1 })).toBe(
             '{"a":null,"c":1}',
         );
+    });
+
+    it("refuses non-finite numbers rather than collapsing them onto null", () => {
+        expect(() => canonicalize({ n: Number.NaN })).toThrow(/finite/);
+        expect(() => canonicalize({ n: Infinity })).toThrow(/finite/);
     });
 
     it("round-trips through JSON without changing the digest", () => {
@@ -192,22 +216,99 @@ describe("sealManifest with a key", () => {
         ).toBe("bad-signature");
     });
 
-    it("produces a signature a plain Ed25519 verifier accepts", () => {
-        // Guards the wire format: the value is a raw Ed25519 signature over
-        // the digest's bytes, verifiable without any of this module's code.
+    it("rejects a malformed or relabelled signature envelope", () => {
         withKey(KEY_A);
         const sealed = sealManifest(BODY);
-        const spki = Buffer.concat([
-            Buffer.from("302a300506032b6570032100", "hex"),
-            Buffer.from(sealed.signature!.public_key, "hex"),
-        ]);
+        const expected = sealed.signature!.public_key;
+
+        expect(
+            verifyManifest(
+                {
+                    ...sealed,
+                    signature: { ...sealed.signature!, algorithm: "rsa" },
+                },
+                expected,
+            ),
+        ).toBe("bad-signature");
+        expect(
+            verifyManifest(
+                {
+                    ...sealed,
+                    signature: {
+                        ...sealed.signature!,
+                        value: `${sealed.signature!.value}zz`,
+                    },
+                },
+                expected,
+            ),
+        ).toBe("bad-signature");
+    });
+
+    it("does not treat an empty expected key as a pinned key", () => {
+        withKey(KEY_A);
+        expect(verifyManifest(sealManifest(BODY), "   ")).toBe(
+            "bad-signature",
+        );
+    });
+
+    it("produces a signature a plain Ed25519 verifier accepts", () => {
+        // Pins the wire format: a raw Ed25519 signature over the context
+        // string, a NUL byte, then the digest bytes — checkable without any
+        // of this module's code.
+        withKey(KEY_A);
+        const sealed = sealManifest(BODY);
         const ok = crypto.verify(
             null,
-            Buffer.from(sealed.digest.value, "hex"),
-            crypto.createPublicKey({ key: spki, format: "der", type: "spki" }),
+            payloadFor(sealed.digest.value, "mike-project-manifest-v1"),
+            publicKeyOf(sealed.signature!.public_key),
             Buffer.from(sealed.signature!.value, "hex"),
         );
         expect(ok).toBe(true);
+    });
+
+    it("rejects a signature made over a different domain context", () => {
+        // Domain separation. Someone holding the signing key signs the same
+        // digest under another context label; that signature must not pass as
+        // a manifest signature, so one signing key can serve several object
+        // types without a signature migrating between them.
+        withKey(KEY_A);
+        const sealed = sealManifest(BODY);
+        const seed = Buffer.from(KEY_A, "hex");
+        const privateKey = crypto.createPrivateKey({
+            key: Buffer.concat([
+                Buffer.from("302e020100300506032b657004220420", "hex"),
+                seed,
+            ]),
+            format: "der",
+            type: "pkcs8",
+        });
+
+        for (const context of [
+            "mike-project-manifest-v2",
+            "mike-user-export-v1",
+            "",
+        ]) {
+            const foreign = crypto
+                .sign(null, payloadFor(sealed.digest.value, context), privateKey)
+                .toString("hex");
+            expect(
+                verifyManifest(
+                    { ...sealed, signature: { ...sealed.signature!, value: foreign } },
+                    sealed.signature!.public_key,
+                ),
+            ).toBe("bad-signature");
+        }
+
+        // The bare digest, unprefixed — the format before domain separation.
+        const unprefixed = crypto
+            .sign(null, Buffer.from(sealed.digest.value, "hex"), privateKey)
+            .toString("hex");
+        expect(
+            verifyManifest(
+                { ...sealed, signature: { ...sealed.signature!, value: unprefixed } },
+                sealed.signature!.public_key,
+            ),
+        ).toBe("bad-signature");
     });
 });
 
