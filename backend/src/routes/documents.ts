@@ -19,6 +19,7 @@ import { buildDownloadUrl } from "../lib/downloadTokens";
 import {
   attachActiveVersionPaths,
   attachLatestVersionNumbers,
+  contentSha256,
   loadActiveVersion,
 } from "../lib/documentVersions";
 import { ensureDocAccess } from "../lib/access";
@@ -533,6 +534,7 @@ documentsRouter.post(
         file_type: sourceType || null,
         size_bytes: active.size_bytes ?? bytes.byteLength,
         page_count: active.page_count,
+        content_sha256: contentSha256(bytes),
       })
       .select("id, version_number, source, created_at, filename")
       .single();
@@ -702,6 +704,7 @@ documentsRouter.post(
         file_type: suffix,
         size_bytes: file.buffer.byteLength,
         page_count: pageCount,
+        content_sha256: contentSha256(file.buffer),
       })
       .select("id, version_number, source, created_at, filename")
       .single();
@@ -897,6 +900,7 @@ documentsRouter.put(
         file_type: suffix,
         size_bytes: file.buffer.byteLength,
         page_count: pageCount,
+        content_sha256: contentSha256(file.buffer),
         created_at: uploadedAt,
       })
       .eq("id", versionId)
@@ -1241,6 +1245,13 @@ async function handleEditResolution(
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   );
 
+  // The rewrite changed the version's stored bytes, so refresh its hash —
+  // otherwise the manifest would attest to the pre-resolution content.
+  await db
+    .from("document_versions")
+    .update({ content_sha256: contentSha256(ab) })
+    .eq("id", doc.current_version_id);
+
   const { error: statusErr } = await db
     .from("document_edits")
     .update({
@@ -1400,6 +1411,7 @@ export async function handleDocumentUpload(
         file_type: suffix,
         size_bytes: content.byteLength,
         page_count: pageCount,
+        content_sha256: contentSha256(content),
       })
       .select("id")
       .single();

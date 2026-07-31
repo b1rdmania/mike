@@ -79,6 +79,11 @@ COURTLISTENER_API_TOKEN=your-courtlistener-token
 
 # Optional: use locally imported CourtListener bulk data for faster case reads.
 COURTLISTENER_BULK_DATA_ENABLED=false
+
+# Optional: Ed25519 seed (openssl rand -hex 32) used to sign project export
+# manifests. Unset means manifests export unsigned. See
+# docs/tamper-evident-export.md.
+MANIFEST_SIGNING_KEY=
 ```
 
 Create `frontend/.env.local`:
@@ -99,6 +104,15 @@ connect to Supabase or the backend API.
 Supabase values come from the project dashboard. Use the project URL for `SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_URL`, the service role key for the backend `SUPABASE_SECRET_KEY`, and the anon/public key for `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY`. If your Supabase project shows multiple key formats, use the legacy JWT-style anon and service role keys expected by the Supabase client libraries.
 
 Provider keys are only needed for the models, legal research, and email features you plan to use. Model provider keys and the CourtListener token can be configured in `backend/.env` for the whole instance, or per user in **Account > Models & API Keys**. If a provider key is present in `backend/.env`, that provider is available by default and the matching browser API key field is read-only.
+
+## Tamper-Evident Export
+
+Every document version's bytes are hashed (SHA-256) at write time, and
+`GET /projects/:projectId/export` returns a manifest of those hashes plus the
+accept/reject trail, so an exported file set can be checked against what the
+workspace held. Setting `MANIFEST_SIGNING_KEY` additionally signs the
+manifest's own digest, and publishes the public key at
+`GET /manifest-signing-key`. See [docs/tamper-evident-export.md](docs/tamper-evident-export.md).
 
 ## CourtListener Integration
 
