@@ -16,6 +16,13 @@ file using `shasum -a 256 lease.docx`.
 Versions created before hashing was deployed retain a `null` digest until their
 bytes are rewritten. They are unverifiable, not falsely verified.
 
+Accept/reject resolution rewrites a version's bytes in place. Storage and the
+database cannot be written atomically, so the hash is cleared first and set
+again afterwards: an interrupted resolution leaves the version unverifiable
+rather than hashed against content it no longer holds. Two resolutions running
+concurrently on one document can still leave the pair mismatched; that race
+already governs the bytes themselves and is not introduced here.
+
 ## Manifest verification
 
 `digest` is SHA-256 over the manifest body (everything except `digest` and

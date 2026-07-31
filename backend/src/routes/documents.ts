@@ -1226,50 +1226,41 @@ async function handleEditResolution(
     return void res.status(200).json(payload);
   }
 
-  // Write resolved bytes to a fresh object, then atomically move the existing
-  // version row to that object together with its hash. Updating an object in
-  // place would allow a database failure (or two concurrent resolutions) to
-  // leave stored bytes paired with the wrong content_sha256.
+  // Overwrite bytes in place at the current version's storage path —
+  // accept/reject mutates the existing version rather than spawning a
+  // new row. This keeps document_versions lean (one row per assistant
+  // edit, not one per accept/reject click) and avoids the N-versions-
+  // per-doc churn as users resolve pending changes.
   const ab = resolvedBytes.buffer.slice(
     resolvedBytes.byteOffset,
     resolvedBytes.byteOffset + resolvedBytes.byteLength,
   ) as ArrayBuffer;
-  const resolvedPath = versionStorageKey(
-    userId,
-    documentId,
-    crypto.randomUUID().replace(/-/g, ""),
-    active?.filename?.trim() || "document.docx",
-  );
-  devLog(`[edit-resolution] writing resolved bytes`, {
-    resolvedPath,
+
+  // Clear the hash before the bytes change, and set it again after. The stored
+  // object and the hash live in different systems, so they cannot be written
+  // atomically; ordering it this way means a failure in between leaves the
+  // version unhashed, which the manifest reports as unverifiable. The
+  // alternative ordering can leave a hash attesting to content the version no
+  // longer holds, which is the one thing the manifest must never do.
+  await db
+    .from("document_versions")
+    .update({ content_sha256: null })
+    .eq("id", doc.current_version_id);
+
+  devLog(`[edit-resolution] overwriting bytes in place`, {
+    latestPath,
     byteLength: ab.byteLength,
   });
   await uploadFile(
-    resolvedPath,
+    latestPath,
     ab,
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   );
 
-  const { data: updatedVersion, error: versionUpdateError } = await db
+  await db
     .from("document_versions")
-    .update({
-      storage_path: resolvedPath,
-      size_bytes: ab.byteLength,
-      content_sha256: contentSha256(ab),
-    })
-    .eq("id", doc.current_version_id)
-    .eq("storage_path", latestPath)
-    .select("id")
-    .maybeSingle();
-  if (versionUpdateError || !updatedVersion) {
-    await deleteFile(resolvedPath).catch(() => {});
-    return void res.status(versionUpdateError ? 500 : 409).json({
-      detail: versionUpdateError
-        ? "Failed to update document version"
-        : "Document changed while resolving the edit. Please try again.",
-    });
-  }
-  await deleteFile(latestPath).catch(() => {});
+    .update({ content_sha256: contentSha256(ab) })
+    .eq("id", doc.current_version_id);
 
   const { error: statusErr } = await db
     .from("document_edits")
@@ -1294,7 +1285,7 @@ async function handleEditResolution(
     ok: true,
     version_id: doc.current_version_id,
     download_url: buildDownloadUrl(
-      resolvedPath,
+      latestPath,
       downloadFilenameForVersion(
         active?.filename,
         active?.version_number ?? null,
